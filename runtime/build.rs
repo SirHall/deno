@@ -178,7 +178,6 @@ mod not_docs {
     ];
 
     let js_runtime = JsRuntime::new(RuntimeOptions {
-      will_snapshot: true,
       extensions,
       ..Default::default()
     });

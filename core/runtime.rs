@@ -275,14 +275,13 @@ pub struct RuntimeOptions {
 
   /// V8 snapshot that should be loaded on startup.
   ///
-  /// Currently can't be used with `will_snapshot`.
+  /// Can't be used if `predictable` is set to true
   pub startup_snapshot: Option<Snapshot>,
 
-  /// Prepare runtime to take snapshot of loaded code.
-  /// The snapshot is determinstic and uses predictable random numbers.
+  /// Seed the new runtime's random number generator with a predictable value.
   ///
-  /// Currently can't be used with `startup_snapshot`.
-  pub will_snapshot: bool,
+  /// Can't be used with `startup_snapshot` if set to true.
+  pub predictable: bool,
 
   /// Isolate creation parameters.
   pub create_params: Option<v8::CreateParams>,
@@ -313,7 +312,7 @@ impl JsRuntime {
     let v8_platform = options.v8_platform.take();
 
     static DENO_INIT: Once = Once::new();
-    DENO_INIT.call_once(move || v8_init(v8_platform, options.will_snapshot));
+    DENO_INIT.call_once(move || v8_init(v8_platform, options.predictable));
 
     let has_startup_snapshot = options.startup_snapshot.is_some();
 
@@ -342,56 +341,56 @@ impl JsRuntime {
       .into_boxed_slice();
 
     let global_context;
-    let (mut isolate, maybe_snapshot_creator) = if options.will_snapshot {
-      // TODO(ry) Support loading snapshots before snapshotting.
-      assert!(options.startup_snapshot.is_none());
-      let mut creator =
-        v8::SnapshotCreator::new(Some(&bindings::EXTERNAL_REFERENCES));
-      // SAFETY: `get_owned_isolate` is unsafe because it may only be called
-      // once. This is the only place we call this function, so this call is
-      // safe.
-      let isolate = unsafe { creator.get_owned_isolate() };
-      let mut isolate = JsRuntime::setup_isolate(isolate);
-      {
-        let scope = &mut v8::HandleScope::new(&mut isolate);
-        let context = bindings::initialize_context(scope, &op_ctxs, false);
-        global_context = v8::Global::new(scope, context);
-        creator.set_default_context(context);
-      }
-      (isolate, Some(creator))
-    } else {
-      let mut params = options
-        .create_params
-        .take()
-        .unwrap_or_else(|| {
-          v8::CreateParams::default().embedder_wrapper_type_info_offsets(
-            V8_WRAPPER_TYPE_INDEX,
-            V8_WRAPPER_OBJECT_INDEX,
-          )
-        })
-        .external_references(&**bindings::EXTERNAL_REFERENCES);
-      let snapshot_loaded = if let Some(snapshot) = options.startup_snapshot {
-        params = match snapshot {
-          Snapshot::Static(data) => params.snapshot_blob(data),
-          Snapshot::JustCreated(data) => params.snapshot_blob(data),
-          Snapshot::Boxed(data) => params.snapshot_blob(data),
-        };
-        true
+    let (mut isolate, maybe_snapshot_creator) =
+      if options.startup_snapshot.is_none() {
+        assert!(options.startup_snapshot.is_none());
+        let mut creator =
+          v8::SnapshotCreator::new(Some(&bindings::EXTERNAL_REFERENCES));
+        // SAFETY: `get_owned_isolate` is unsafe because it may only be called
+        // once. This is the only place we call this function, so this call is
+        // safe.
+        let isolate = unsafe { creator.get_owned_isolate() };
+        let mut isolate = JsRuntime::setup_isolate(isolate);
+        {
+          let scope = &mut v8::HandleScope::new(&mut isolate);
+          let context = bindings::initialize_context(scope, &op_ctxs, false);
+          global_context = v8::Global::new(scope, context);
+          creator.set_default_context(context);
+        }
+        (isolate, Some(creator))
       } else {
-        false
+        let mut params = options
+          .create_params
+          .take()
+          .unwrap_or_else(|| {
+            v8::CreateParams::default().embedder_wrapper_type_info_offsets(
+              V8_WRAPPER_TYPE_INDEX,
+              V8_WRAPPER_OBJECT_INDEX,
+            )
+          })
+          .external_references(&**bindings::EXTERNAL_REFERENCES);
+        let snapshot_loaded = if let Some(snapshot) = options.startup_snapshot {
+          params = match snapshot {
+            Snapshot::Static(data) => params.snapshot_blob(data),
+            Snapshot::JustCreated(data) => params.snapshot_blob(data),
+            Snapshot::Boxed(data) => params.snapshot_blob(data),
+          };
+          true
+        } else {
+          false
+        };
+
+        let isolate = v8::Isolate::new(params);
+        let mut isolate = JsRuntime::setup_isolate(isolate);
+        {
+          let scope = &mut v8::HandleScope::new(&mut isolate);
+          let context =
+            bindings::initialize_context(scope, &op_ctxs, snapshot_loaded);
+
+          global_context = v8::Global::new(scope, context);
+        }
+        (isolate, None)
       };
-
-      let isolate = v8::Isolate::new(params);
-      let mut isolate = JsRuntime::setup_isolate(isolate);
-      {
-        let scope = &mut v8::HandleScope::new(&mut isolate);
-        let context =
-          bindings::initialize_context(scope, &op_ctxs, snapshot_loaded);
-
-        global_context = v8::Global::new(scope, context);
-      }
-      (isolate, None)
-    };
 
     let inspector =
       JsRuntimeInspector::new(&mut isolate, global_context.clone());
@@ -718,8 +717,9 @@ impl JsRuntime {
       .execute_script(self.v8_isolate(), name, source_code)
   }
 
-  /// Takes a snapshot. The isolate should have been created with will_snapshot
-  /// set to true.
+  /// Takes the current state of the runtime and generates an array of bytes
+  /// representing that can then be used to reconstruct
+  /// the runtime state at a later time.
   ///
   /// `Error` can usually be downcast to `JsError`.
   pub fn snapshot(&mut self) -> v8::StartupData {
@@ -2169,6 +2169,7 @@ pub mod tests {
   use std::rc::Rc;
   use std::sync::atomic::{AtomicUsize, Ordering};
   use std::sync::Arc;
+  use v8::StartupData;
   // deno_ops macros generate code assuming deno_core in scope.
   mod deno_core {
     pub use crate::*;
@@ -2655,12 +2656,9 @@ pub mod tests {
   }
 
   #[test]
-  fn will_snapshot() {
+  fn snapshot_reload() {
     let snapshot = {
-      let mut runtime = JsRuntime::new(RuntimeOptions {
-        will_snapshot: true,
-        ..Default::default()
-      });
+      let mut runtime = JsRuntime::new(RuntimeOptions::default());
       runtime.execute_script("a.js", "a = 1 + 2").unwrap();
       runtime.snapshot()
     };
@@ -2676,12 +2674,33 @@ pub mod tests {
   }
 
   #[test]
-  fn test_from_boxed_snapshot() {
-    let snapshot = {
+  fn snapshotting_multiple_runs() {
+    let mut startup_data: StartupData = {
+      let mut runtime = JsRuntime::new(RuntimeOptions::default());
+      runtime.execute_script("a.js", "a = 0").unwrap();
+      runtime.snapshot()
+    };
+
+    for i in 1..10 {
+      let snapshot = Snapshot::JustCreated(startup_data);
       let mut runtime = JsRuntime::new(RuntimeOptions {
-        will_snapshot: true,
+        startup_snapshot: Some(snapshot),
         ..Default::default()
       });
+      runtime
+        .execute_script(
+          format!("run_{}.js", i).as_str(),
+          format!("++a; if (a!==({i}) throw Error('x')").as_str(),
+        )
+        .unwrap();
+      startup_data = runtime.snapshot();
+    }
+  }
+
+  #[test]
+  fn test_from_boxed_snapshot() {
+    let snapshot = {
+      let mut runtime = JsRuntime::new(RuntimeOptions::default());
       runtime.execute_script("a.js", "a = 1 + 2").unwrap();
       let snap: &[u8] = &*runtime.snapshot();
       Vec::from(snap).into_boxed_slice()
@@ -2898,7 +2917,6 @@ pub mod tests {
     let loader = std::rc::Rc::new(ModsLoader::default());
     let mut runtime = JsRuntime::new(RuntimeOptions {
       module_loader: Some(loader),
-      will_snapshot: true,
       ..Default::default()
     });
 
@@ -3448,7 +3466,7 @@ assertEquals(1, notify_return_value);
         Deno.core.ops.op_set_promise_reject_callback((type, promise, reason) => {
           Deno.core.ops.op_promise_reject();
         });
-        
+
         throw new Error('top level throw');
         "#;
 
@@ -3701,10 +3719,7 @@ assertEquals(1, notify_return_value);
   #[test]
   fn js_realm_init_snapshot() {
     let snapshot = {
-      let mut runtime = JsRuntime::new(RuntimeOptions {
-        will_snapshot: true,
-        ..Default::default()
-      });
+      let mut runtime = JsRuntime::new(RuntimeOptions::default());
       let snap: &[u8] = &*runtime.snapshot();
       Vec::from(snap).into_boxed_slice()
     };

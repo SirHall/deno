@@ -259,7 +259,6 @@ fn create_compiler_snapshot(
     }
   }
   let js_runtime = JsRuntime::new(RuntimeOptions {
-    will_snapshot: true,
     extensions: vec![Extension::builder()
       .ops(vec![
         op_build_info::decl(),
